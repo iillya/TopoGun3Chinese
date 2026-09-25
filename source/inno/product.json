@@ -1,0 +1,13 @@
+{
+  "product": "TopoGun",
+  "exe": "TopoGun.exe",
+  "default": "TopoGun 3",
+  "icon": "topogun.ico",
+  "payload": {
+    "topogun.ico": "icon/topogun.ico",
+    "TopoGunChineseHook.dll": "build/out/TopoGunChineseHook.dll",
+    "TopoGunChineseLauncher.exe": "build/out/TopoGunChineseLauncher.exe",
+    "translations/dictionary_ui_zh.json": "source/translations/dictionary_ui_zh.json"
+  },
+  "id": "TopoGunChinese"
+}

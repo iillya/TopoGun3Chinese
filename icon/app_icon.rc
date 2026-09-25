@@ -1,0 +1,27 @@
+1 ICON "topogun.ico"
+
+#include <windows.h>
+#include "../source/version.h"
+1 VERSIONINFO
+FILEVERSION TOPOGUN_CHINESE_FILE_VERSION
+PRODUCTVERSION TOPOGUN_CHINESE_FILE_VERSION
+FILEFLAGSMASK 0x3fL
+FILEFLAGS 0
+FILEOS VOS_NT_WINDOWS32
+FILETYPE VFT_UNKNOWN
+BEGIN
+  BLOCK "StringFileInfo"
+  BEGIN
+    BLOCK "080404b0"
+    BEGIN
+      VALUE "FileDescription", "TopoGun Chinese Localizer"
+      VALUE "FileVersion", TOPOGUN_CHINESE_VERSION
+      VALUE "ProductName", "TopoGun Chinese"
+      VALUE "ProductVersion", TOPOGUN_CHINESE_VERSION
+    END
+  END
+  BLOCK "VarFileInfo"
+  BEGIN
+    VALUE "Translation", 0x0804, 1200
+  END
+END

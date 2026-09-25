@@ -1,0 +1,3 @@
+#pragma once
+#define TOPOGUN_CHINESE_VERSION "1.0.0"
+#define TOPOGUN_CHINESE_FILE_VERSION 1,0,0,0
