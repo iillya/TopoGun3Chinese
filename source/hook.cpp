@@ -13,14 +13,12 @@
 //                API -- no mangled symbols, no hand-written x64 sret ABI -- so
 //                it follows the Qt 5 public style API.
 //  ItemViewLayer QStyledItemDelegate::displayText for list/tree/table.
-//  PaintLayer    QPainter::drawText IAT hook for QLabel + custom-painted text.
-//                All 8 overloads return void, so the hook is ABI-safe; it never
-//                double-translates because it skips strings already containing CJK.
-//  MeasureLayer  QFontMetrics/QFontMetricsF IAT hooks (incl. QFontMetrics::size
-//                patched by import-name and QFontMetrics::boundingRect(int,...)
-//                which QLabel uses): layout measures the translated width, so
-//                sizeHint / eliding follow the language and UI width matches.
-//                This is the whole sizing story -- no setMinimumWidth needed.
+//  PaintLayer    QPainter::drawText IAT hook for QWidget painting and QStyle
+//                offscreen UI caches. Unscoped image/asset/export painting is
+//                left in the source language.
+//  MeasureLayer  QFontMetrics/QFontMetricsF IAT hooks inside Qt5Widgets only.
+//                Widget layout can measure the translated width while host
+//                model/export code continues to receive source-text metrics.
 //  Data model    Never rewritten: no setText/setTabText/setItemText mutations.
 //  Controls      F3 enable/disable; Shift+` dumps untranslated text to a JSON.
 //  API           C exports so a future settings UI / updater can version it.
@@ -33,6 +31,7 @@
 #include <windows.h>
 
 #include "hook_lifecycle.h"
+#include "ui_paint_boundary.h"
 #include "version.h"
 #include "qt_compatibility.h"
 #include "hotkey_settings.h"
@@ -65,6 +64,8 @@
 #include <QtCore/QAbstractItemModel>
 #include <QtWidgets/QAction>
 #include <QtGui/QPainter>
+#include <QtGui/QImage>
+#include <QtGui/QPixmap>
 #include <QtGui/QColor>
 #include <QtGui/QFontMetrics>
 #include <QtGui/QTextOption>
@@ -365,10 +366,41 @@ class ChineseProxyStyle : public QProxyStyle {
 public:
     using QProxyStyle::QProxyStyle;
 
+    void drawControl(ControlElement element, const QStyleOption* option,
+                     QPainter* painter, const QWidget* widget = nullptr) const override {
+        UiPaintBoundary::WidgetPaintScope uiPaint(painter, widget);
+        if (option && element == CE_MenuBarItem) {
+            if (const auto* item = qstyleoption_cast<const QStyleOptionMenuItem*>(option)) {
+                if (item->text == QStringLiteral("中/英") ||
+                    item->text == QStringLiteral("Bilibili 神说要凑数汉化")) {
+                    QStyleOptionMenuItem copy(*item);
+                    copy.state &= ~(State_Selected | State_MouseOver | State_Sunken);
+                    QProxyStyle::drawControl(element, &copy, painter, widget);
+                    return;
+                }
+            }
+        }
+        QProxyStyle::drawControl(element, option, painter, widget);
+    }
+
+    void drawPrimitive(PrimitiveElement element, const QStyleOption* option,
+                       QPainter* painter, const QWidget* widget = nullptr) const override {
+        UiPaintBoundary::WidgetPaintScope uiPaint(painter, widget);
+        QProxyStyle::drawPrimitive(element, option, painter, widget);
+    }
+
+    void drawComplexControl(ComplexControl control, const QStyleOptionComplex* option,
+                            QPainter* painter, const QWidget* widget = nullptr) const override {
+        UiPaintBoundary::WidgetPaintScope uiPaint(painter, widget);
+        QProxyStyle::drawComplexControl(control, option, painter, widget);
+    }
+
     void drawItemText(QPainter* painter, const QRect& rect, int flags,
                       const QPalette& pal, bool enabled, const QString& text,
                       QPalette::ColorRole textRole = QPalette::NoRole) const override {
-        const QString tr = translated(text);
+        UiPaintBoundary::WidgetPaintScope uiPaint(painter);
+        const QString tr = UiPaintBoundary::isDisplayPainter(painter)
+            ? translated(text) : QString();
         const QString draw = tr.isEmpty() ? text : tr;
         // Plugin menu actions share the attribution blue.
         if (text == QStringLiteral("中/英") ||
@@ -465,10 +497,12 @@ static void toggleTranslation() {
     // language (Qt widgets recompute cached metrics in changeEvent(FontChange)),
     // which is what clicking a node also does -- a plain repaint() only redraws
     // the stale cache and is not enough.
-    for (QWidget* w : QApplication::allWidgets()) {
+    std::vector<QPointer<QWidget>> widgets;
+    for (QWidget* widget : QApplication::allWidgets()) widgets.emplace_back(widget);
+    for (const auto& w : widgets) {
         if (!w) continue;
         QEvent ev(QEvent::FontChange);
-        QApplication::sendEvent(w, &ev);
+        QApplication::sendEvent(w.data(), &ev);
     }
     refreshLayouts();
     // Force the (persistent) top menu bar to re-measure its action rects on a
@@ -476,8 +510,8 @@ static void toggleTranslation() {
     // itemsDirty is set; QMenuBar::changeEvent() does exactly that on
     // StyleChange / FontChange / ApplicationFontChange, so the menu items
     // shrink/grow to the measured Chinese / English width immediately.
-    for (QWidget* w : QApplication::allWidgets()) {
-        if (auto* mb = qobject_cast<QMenuBar*>(w)) {
+    for (const auto& w : widgets) {
+        if (auto* mb = qobject_cast<QMenuBar*>(w.data())) {
             QEvent ev(QEvent::StyleChange);
             QApplication::sendEvent(mb, &ev);
         }
@@ -821,6 +855,12 @@ static QString translateElidedUncached(const QString& text) {
     return best ? translated(QString::fromUtf8(best->c_str())) : QString();
 }
 
+// A style can also be called for an exported image. A QWidget paint target or
+// a known visible widget owner establishes the display-cache scope.
+static bool isDisplayPainter(const QPainter* painter) {
+    return painter && painter->isActive() && UiPaintBoundary::isDisplayPainter(painter);
+}
+
 static QString translatePaint(QPainter* painter, const QString& text) {
     if (!g_enabled) return {};
     if (text.isEmpty() || containsCjk(text)) return {};
@@ -879,11 +919,11 @@ class PluginLabelPen final {
     QPen previous_;
 public:
     PluginLabelPen(QPainter* painter, const QString& text) {
-        if (!painter || (text != QStringLiteral("中/英") &&
+        if (!isDisplayPainter(painter) || (text != QStringLiteral("中/英") &&
             text != QStringLiteral("Bilibili 神说要凑数汉化"))) return;
         painter_ = painter;
         previous_ = painter->pen();
-        // Draw just this action's hover background; host menu styling stays intact.
+        // Cover the full native selection rectangle so no pale border remains.
         auto* bar = qobject_cast<QMenuBar*>(dynamic_cast<QWidget*>(painter->device()));
         if (bar && bar->property("topogun_hover_label").toString() == text) {
             for (QAction* action : bar->actions()) {
@@ -891,7 +931,7 @@ public:
                 painter->save();
                 painter->setPen(Qt::NoPen);
                 painter->setBrush(QColor(0x3D, 0x50, 0x66));
-                painter->drawRoundedRect(bar->actionGeometry(action).adjusted(1, 2, -1, -2), 3, 3);
+                painter->drawRect(bar->actionGeometry(action));
                 painter->restore();
                 break;
             }
@@ -905,42 +945,42 @@ public:
 
 static void hookedDrawPoint(QPainter* p, const QPoint& pt, const QString& t) {
     PluginLabelPen color(p, t);
-    QString tr = translatePaint(p, t);
+    QString tr = isDisplayPainter(p) ? translatePaint(p, t) : QString();
     if (g_drawPoint) g_drawPoint(p, pt, tr.isEmpty() ? t : tr);
 }
 static void hookedDrawPointF(QPainter* p, const QPointF& pt, const QString& t) {
     PluginLabelPen color(p, t);
-    QString tr = translatePaint(p, t);
+    QString tr = isDisplayPainter(p) ? translatePaint(p, t) : QString();
     if (g_drawPointF) g_drawPointF(p, pt, tr.isEmpty() ? t : tr);
 }
 static void hookedDrawRect(QPainter* p, const QRect& r, int f, const QString& t, QRect* br) {
     PluginLabelPen color(p, t);
-    QString tr = translatePaint(p, t);
+    QString tr = isDisplayPainter(p) ? translatePaint(p, t) : QString();
     if (g_drawRect) g_drawRect(p, r, f, tr.isEmpty() ? t : tr, br);
 }
 static void hookedDrawRectFOption(QPainter* p, const QRectF& r, const QString& t, const QTextOption& o) {
     PluginLabelPen color(p, t);
-    QString tr = translatePaint(p, t);
+    QString tr = isDisplayPainter(p) ? translatePaint(p, t) : QString();
     if (g_drawRectFOption) g_drawRectFOption(p, r, tr.isEmpty() ? t : tr, o);
 }
 static void hookedDrawRectFAlign(QPainter* p, const QRectF& r, int f, const QString& t, QRectF* br) {
     PluginLabelPen color(p, t);
-    QString tr = translatePaint(p, t);
+    QString tr = isDisplayPainter(p) ? translatePaint(p, t) : QString();
     if (g_drawRectFAlign) g_drawRectFAlign(p, r, f, tr.isEmpty() ? t : tr, br);
 }
 static void hookedDrawXY(QPainter* p, int x, int y, const QString& t) {
     PluginLabelPen color(p, t);
-    QString tr = translatePaint(p, t);
+    QString tr = isDisplayPainter(p) ? translatePaint(p, t) : QString();
     if (g_drawXY) g_drawXY(p, x, y, tr.isEmpty() ? t : tr);
 }
 static void hookedDrawXYWH(QPainter* p, int x, int y, int w, int h, int f, const QString& t, QRect* br) {
     PluginLabelPen color(p, t);
-    QString tr = translatePaint(p, t);
+    QString tr = isDisplayPainter(p) ? translatePaint(p, t) : QString();
     if (g_drawXYWH) g_drawXYWH(p, x, y, w, h, f, tr.isEmpty() ? t : tr, br);
 }
 static void hookedDrawPointF2(QPainter* p, const QPointF& pt, const QString& t, int f, int d) {
     PluginLabelPen color(p, t);
-    QString tr = translatePaint(p, t);
+    QString tr = isDisplayPainter(p) ? translatePaint(p, t) : QString();
     if (g_drawPointF2) g_drawPointF2(p, pt, tr.isEmpty() ? t : tr, f, d);
 }
 
@@ -1019,13 +1059,15 @@ static bool replaceImportByName(HMODULE module, const char* name, void* replacem
 }
 
 // ---------------------------------------------------------------------------
-// QFontMetrics measurement hooks.
+// QFontMetrics measurement hooks, scoped to Qt5Widgets' UI layout code.
 //
 // Qt layouts calculate sizeHint from the widget's ORIGINAL English text. The
 // pure-paint path translates only at drawText time, so the layout can leave too
 // little space for the wider Chinese rendering. Mirroring Toolbag's approach,
-// translate the string at the font-measurement boundary instead: the widget
-// keeps English internally while layout/eliding sees the Chinese glyph bounds.
+// translate only Qt5Widgets' measurement calls: the widget keeps English
+// internally while its layout/eliding sees the Chinese glyph bounds. Hooking
+// TopoGun.exe or arbitrary plug-ins here could also change exported text
+// geometry or other non-UI calculations, so those callers are left untouched.
 // ---------------------------------------------------------------------------
 typedef int (__fastcall* FmHAdv)(const QFontMetrics*, const QString&, int);
 typedef int (__fastcall* FmHAdvOpt)(const QFontMetrics*, const QString&, const QTextOption&);
@@ -1080,38 +1122,29 @@ static bool       g_fontHooksInstalled = false;
 // (never installs / never calls the raw-ABI pointers) rather than risking a
 // crash on a mismatched calling convention.
 static bool       g_fontMeasureReady = false;
+static DWORD      g_metricGuiThread = 0;
 
 static QString measureText(const QString& text) {
-    if (!g_enabled || text.isEmpty() || containsCjk(text)) return {};
+    if (!g_enabled || GetCurrentThreadId() != g_metricGuiThread ||
+        text.isEmpty() || containsCjk(text)) return {};
     return translated(text);
-}
-
-// One CJK glyph is roughly the font's em advance.  Measure a representative "中"
-// with the REAL (unhooked) advance so we don't recurse; fall back to the height.
-// Adds a one-CJK-character of slack when the text was translated to Chinese, so
-// Chinese-leaning UI is a touch roomier and never clips.
-static int cjkPad(const QFontMetrics* fm) {
-    if (g_fmHAdv) { int w = g_fmHAdv(fm, QStringLiteral("中"), -1); if (w > 0) return w; }
-    return fm->height();
-}
-static int cjkPadF(const QFontMetricsF* fm) {
-    if (g_fmfHAdv) { qreal w = g_fmfHAdv(fm, QStringLiteral("中"), -1); if (w > 0) return (int)w; }
-    return (int)fm->height();
 }
 
 static int hookedFontHAdv(const QFontMetrics* fm, const QString& text, int len) {
     QString t = text;
-    QString tr = measureText(text);
+    // Prefix lengths index the source string (cursor/selection layout). Only
+    // whole-string measurements can be replaced by the full translation.
+    QString tr = (len < 0 || len >= text.size()) ? measureText(text) : QString();
     if (!tr.isEmpty()) t = tr;
-    if (len >= 0 && len > t.size()) len = static_cast<int>(t.size());
-    if (g_fmHAdv) return g_fmHAdv(fm, t, len) + (tr.isEmpty() ? 0 : cjkPad(fm));
+    if (!tr.isEmpty()) len = -1;
+    if (g_fmHAdv) return g_fmHAdv(fm, t, len);
     return 0;
 }
 static int hookedFontHAdvOpt(const QFontMetrics* fm, const QString& text, const QTextOption& opt) {
     QString t = text;
     QString tr = measureText(text);
     if (!tr.isEmpty()) t = tr;
-    if (g_fmHAdvOpt) return g_fmHAdvOpt(fm, t, opt) + (tr.isEmpty() ? 0 : cjkPad(fm));
+    if (g_fmHAdvOpt) return g_fmHAdvOpt(fm, t, opt);
     return 0;
 }
 static void* hookedFontBRect(const QFontMetrics* fm, QRect* result, const QString& text) {
@@ -1119,7 +1152,6 @@ static void* hookedFontBRect(const QFontMetrics* fm, QRect* result, const QStrin
     QString tr = measureText(text);
     if (!tr.isEmpty()) t = tr;
     if (g_fmBRect) g_fmBRect(fm, result, t);
-    if (!tr.isEmpty()) result->setWidth(result->width() + cjkPad(fm));
     return result;
 }
 static void* hookedFontBRectOpt(const QFontMetrics* fm, QRect* result, const QString& text, const QTextOption& opt) {
@@ -1127,7 +1159,6 @@ static void* hookedFontBRectOpt(const QFontMetrics* fm, QRect* result, const QSt
     QString tr = measureText(text);
     if (!tr.isEmpty()) t = tr;
     if (g_fmBRectOpt) g_fmBRectOpt(fm, result, t, opt);
-    if (!tr.isEmpty()) result->setWidth(result->width() + cjkPad(fm));
     return result;
 }
 static void* hookedFontBRectRect(const QFontMetrics* fm, QRect* result, const QRect& r, int flags, const QString& text, int tabstops, int* tabarray) {
@@ -1135,7 +1166,6 @@ static void* hookedFontBRectRect(const QFontMetrics* fm, QRect* result, const QR
     QString tr = measureText(text);
     if (!tr.isEmpty()) t = tr;
     if (g_fmBRectRect) g_fmBRectRect(fm, result, r, flags, t, tabstops, tabarray);
-    if (!tr.isEmpty()) result->setWidth(result->width() + cjkPad(fm));
     return result;
 }
 static void* hookedFontBRectXYWH(const QFontMetrics* fm, QRect* result, int x, int y, int w, int h, int flags, const QString& text, int tabstops, int* tabarray) {
@@ -1143,7 +1173,6 @@ static void* hookedFontBRectXYWH(const QFontMetrics* fm, QRect* result, int x, i
     QString tr = measureText(text);
     if (!tr.isEmpty()) t = tr;
     if (g_fmBRectXYWH) g_fmBRectXYWH(fm, result, x, y, w, h, flags, t, tabstops, tabarray);
-    if (!tr.isEmpty()) result->setWidth(result->width() + cjkPad(fm));
     return result;
 }
 static void* hookedFontSize(const QFontMetrics* fm, QSize* result, int flags, const QString& text, int tabstops, int* tabarray) {
@@ -1151,7 +1180,6 @@ static void* hookedFontSize(const QFontMetrics* fm, QSize* result, int flags, co
     QString tr = measureText(text);
     if (!tr.isEmpty()) t = tr;
     if (g_fmSize) g_fmSize(fm, result, flags, t, tabstops, tabarray);
-    if (!tr.isEmpty()) result->setWidth(result->width() + cjkPad(fm));
     return result;
 }
 static void* hookedFontTBRect(const QFontMetrics* fm, QRect* result, const QString& text) {
@@ -1179,17 +1207,17 @@ static void* hookedFontElide(const QFontMetrics* fm, QString* result, const QStr
 
 static qreal hookedFontFHAdv(const QFontMetricsF* fm, const QString& text, int len) {
     QString t = text;
-    QString tr = measureText(text);
+    QString tr = (len < 0 || len >= text.size()) ? measureText(text) : QString();
     if (!tr.isEmpty()) t = tr;
-    if (len >= 0 && len > t.size()) len = static_cast<int>(t.size());
-    if (g_fmfHAdv) return g_fmfHAdv(fm, t, len) + (tr.isEmpty() ? 0 : cjkPadF(fm));
+    if (!tr.isEmpty()) len = -1;
+    if (g_fmfHAdv) return g_fmfHAdv(fm, t, len);
     return 0;
 }
 static qreal hookedFontFHAdvOpt(const QFontMetricsF* fm, const QString& text, const QTextOption& opt) {
     QString t = text;
     QString tr = measureText(text);
     if (!tr.isEmpty()) t = tr;
-    if (g_fmfHAdvOpt) return g_fmfHAdvOpt(fm, t, opt) + (tr.isEmpty() ? 0 : cjkPadF(fm));
+    if (g_fmfHAdvOpt) return g_fmfHAdvOpt(fm, t, opt);
     return 0;
 }
 static void* hookedFontFBRect(const QFontMetricsF* fm, QRectF* result, const QString& text) {
@@ -1197,7 +1225,6 @@ static void* hookedFontFBRect(const QFontMetricsF* fm, QRectF* result, const QSt
     QString tr = measureText(text);
     if (!tr.isEmpty()) t = tr;
     if (g_fmfBRect) g_fmfBRect(fm, result, t);
-    if (!tr.isEmpty()) result->setWidth(result->width() + cjkPadF(fm));
     return result;
 }
 static void* hookedFontFBRectOpt(const QFontMetricsF* fm, QRectF* result, const QString& text, const QTextOption& opt) {
@@ -1205,7 +1232,6 @@ static void* hookedFontFBRectOpt(const QFontMetricsF* fm, QRectF* result, const 
     QString tr = measureText(text);
     if (!tr.isEmpty()) t = tr;
     if (g_fmfBRectOpt) g_fmfBRectOpt(fm, result, t, opt);
-    if (!tr.isEmpty()) result->setWidth(result->width() + cjkPadF(fm));
     return result;
 }
 static void* hookedFontFBRectRect(const QFontMetricsF* fm, QRectF* result, const QRectF& r, int flags, const QString& text, int tabstops, int* tabarray) {
@@ -1213,7 +1239,6 @@ static void* hookedFontFBRectRect(const QFontMetricsF* fm, QRectF* result, const
     QString tr = measureText(text);
     if (!tr.isEmpty()) t = tr;
     if (g_fmfBRectRect) g_fmfBRectRect(fm, result, r, flags, t, tabstops, tabarray);
-    if (!tr.isEmpty()) result->setWidth(result->width() + cjkPadF(fm));
     return result;
 }
 static void* hookedFontFSize(const QFontMetricsF* fm, QSizeF* result, int flags, const QString& text, int tabstops, int* tabarray) {
@@ -1221,7 +1246,6 @@ static void* hookedFontFSize(const QFontMetricsF* fm, QSizeF* result, int flags,
     QString tr = measureText(text);
     if (!tr.isEmpty()) t = tr;
     if (g_fmfSize) g_fmfSize(fm, result, flags, t, tabstops, tabarray);
-    if (!tr.isEmpty()) result->setWidth(result->width() + cjkPadF(fm));
     return result;
 }
 static void* hookedFontFTBRect(const QFontMetricsF* fm, QRectF* result, const QString& text) {
@@ -1280,9 +1304,9 @@ static bool fontSymbolsAreValid() {
     return true;
 }
 
-// (Re)scan every loaded module and redirect the QFontMetrics measurement
-// imports (and the QFontMetrics::size import-slot).  Idempotent, so it also
-// patches any DLL that loads after the first pass.
+// Redirect only Qt5Widgets' QFontMetrics imports. Qt5Widgets owns standard
+// widget layout and eliding, while host and plug-in modules may also measure
+// text for scene assets or exports. Do not patch those modules globally.
 static void patchFontModules() {
     if (!g_fontMeasureReady) return;   // layer disabled: never patch/call
     struct Sym { const char* name; void* orig; void* hook; };
@@ -1307,40 +1331,26 @@ static void patchFontModules() {
         {"FMfTBRectOpt",(void*)g_fmfTBRectOpt,(void*)&hookedFontFTBRectOpt},
         {"FMfElide",    (void*)g_fmfElide,    (void*)&hookedFontFElide},
     };
-    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, GetCurrentProcessId());
-    if (snap != INVALID_HANDLE_VALUE) {
-        MODULEENTRY32W mod{}; mod.dwSize = sizeof(mod);
-        if (Module32FirstW(snap, &mod)) {
-            do {
-                if (_wcsnicmp(mod.szModule, kHookDllPrefix, wcslen(kHookDllPrefix)) == 0) continue;
-                if (_wcsicmp(mod.szModule, kCoreModule) == 0) continue;
-                HMODULE h = GetModuleHandleW(mod.szModule);
-                if (!h) continue;
-                for (auto& s : syms) {
-                    if (s.orig) replaceImports(h, s.orig, s.hook);
-                }
-                {
-                    void* orig = nullptr;
-                    if (replaceImportByName(h,
-                            "?size@QFontMetrics@@QEBA?AVQSize@@HAEBVQString@@HPEAH@Z",
-                            (void*)&hookedFontSize, &orig) && !g_fmSize && orig)
-                        g_fmSize = (FmSizeRaw)orig;
-                }
-                {
-                    void* orig = nullptr;
-                    if (replaceImportByName(h,
-                            "?size@QFontMetricsF@@QEBA?AVQSizeF@@HAEBVQString@@HPEAH@Z",
-                            (void*)&hookedFontFSize, &orig) && !g_fmfSize && orig)
-                        g_fmfSize = (FmFSizeRaw)orig;
-                }
-            } while (Module32NextW(snap, &mod));
-        }
-        CloseHandle(snap);
+    HMODULE widgets = GetModuleHandleW(kWidgetsModule);
+    if (!widgets) return;
+    for (const auto& symbol : syms) {
+        if (symbol.orig) replaceImports(widgets, symbol.orig, symbol.hook);
     }
+    void* original = nullptr;
+    if (replaceImportByName(widgets,
+            "?size@QFontMetrics@@QEBA?AVQSize@@HAEBVQString@@HPEAH@Z",
+            (void*)&hookedFontSize, &original) && !g_fmSize && original)
+        g_fmSize = (FmSizeRaw)original;
+    original = nullptr;
+    if (replaceImportByName(widgets,
+            "?size@QFontMetricsF@@QEBA?AVQSizeF@@HAEBVQString@@HPEAH@Z",
+            (void*)&hookedFontFSize, &original) && !g_fmfSize && original)
+        g_fmfSize = (FmFSizeRaw)original;
 }
 
 static void installFontMeasurementHooks() {
     if (g_fontHooksInstalled) return;
+    g_metricGuiThread = GetCurrentThreadId();
     HMODULE qtGui = GetModuleHandleW(kGuiModule);
     if (!qtGui) return;
 
@@ -1495,10 +1505,6 @@ static QPointer<QAction> g_langAction;
 static QPointer<QAction> g_authorAction;
 static QPointer<QMenuBar> g_authorLinkBar;   // kept for the hotkey-dialog parent
 
-static void doToggleLanguage() {
-    toggleTranslation();
-}
-
 static void openHotkeyDialog() {
     static QPointer<ToggleHotkeyDialog> g_hotkeyDlg;
     if (g_hotkeyDlg) {
@@ -1576,7 +1582,7 @@ public:
             if (me->button() == Qt::LeftButton) {
                 pressed_ = false;
                 if (mb && mb->actionGeometry(g_langAction).contains(me->pos()))
-                    doToggleLanguage();                 // fire on release over 中/英
+                    g_langAction->trigger();            // single action on release over 中/英
                 return true;
             }
         }
@@ -1609,6 +1615,9 @@ static void installAuthorLink() {
     // "中/英" as a real menu-bar action -> inherits the exact Help item style.
     QAction* langAct = new QAction(QStringLiteral("中/英"), mb);
     langAct->setObjectName(QStringLiteral("topogun_lang"));
+    // Mouse releases above are consumed, so routing them through the same
+    // action also supports keyboard/accessibility activation without toggling twice.
+    QObject::connect(langAct, &QAction::triggered, langAct, [] { toggleTranslation(); });
     g_langAction = langAct;
     mb->installEventFilter(new LangMouseFilter(mb));   // right-click -> hotkey dialog
     mb->setMouseTracking(true);
@@ -1666,7 +1675,8 @@ static void RunOnGuiThread(QApplication* app) {
 
     // Phase 2: TranslatorFilter handles widgets created later. Phase 3 is an
     // optional bounded fallback for plug-in DLLs that load after startup and
-    // therefore escape the initial drawText/font-measurement IAT scan.
+    // therefore escape the initial drawText IAT scan. Font measurement is
+    // intentionally limited to Qt5Widgets, which is already loaded here.
     if (!TopoGunHookLifecycle::kEnableDeferredPolling)
         return;
 
@@ -1674,7 +1684,6 @@ static void RunOnGuiThread(QApplication* app) {
     rescanTimer->setInterval(TopoGunHookLifecycle::kDeferredScanIntervalMs);
     QObject::connect(rescanTimer, &QTimer::timeout, [] {
         patchDrawTextModules();
-        patchFontModules();
     });
     rescanTimer->start();
     QTimer::singleShot(TopoGunHookLifecycle::kDeferredScanWindowMs, app,
@@ -1690,6 +1699,11 @@ static DWORD WINAPI Worker(LPVOID) {
                                                      requiredQtMajor)) {
         return 2;
     }
+    HMODULE pinned = nullptr;
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                           GET_MODULE_HANDLE_EX_FLAG_PIN,
+                           reinterpret_cast<LPCWSTR>(g_selfModule), &pinned))
+        return 3;
     QApplication* app = nullptr;
     // Wait up to ~300s for QApplication. TopoGun can block on licensing /
     // update checks before the GUI is created, so allow a generous window and

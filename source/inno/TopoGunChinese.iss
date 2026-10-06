@@ -39,7 +39,7 @@ SolidCompression=yes
 CloseApplications=no
 RestartApplications=no
 RestartIfNeededByRun=no
-ChangesAssociations=no
+ChangesAssociations=yes
 SetupLogging=yes
 UninstallLogging=no
 #ifdef TestMode
@@ -57,11 +57,12 @@ DialogFontSize=10
 
 [Messages]
 SelectDirLabel3=请选择包含 TopoGun.exe 的软件目录。补丁只写入其下的 ChineseLauncher 文件夹。
-FinishedLabel=中文补丁已安装。请通过“TopoGun 中文版”快捷方式启动软件。%n%n卸载请使用 Windows“已安装的应用”。卸载会完整删除 ChineseLauncher 文件夹及其中的全部文件，不保留词典、设置或备份。
+FinishedLabel=中文补丁已安装。可通过“TopoGun 中文版”快捷方式启动；勾选文件关联后，也可双击 .tgs 工程文件打开。Windows 已手动指定的默认应用需要在“打开方式”中更改。%n%n卸载会恢复仍由本补丁管理的原文件关联，并完整删除 ChineseLauncher 文件夹及其中的全部文件。
 
 [Tasks]
 Name: "desktopicon"; Description: "创建公共桌面快捷方式"
 Name: "startmenuicon"; Description: "创建开始菜单快捷方式（所有用户）"
+Name: "fileassoc"; Description: "使用 TopoGun 中文版打开 .tgs 工程文件（当前用户）"
 
 
 [Files]
@@ -74,11 +75,9 @@ Name: "{autodesktop}\TopoGun 中文版"; Filename: "{app}\ChineseLauncher\TopoGu
 Name: "{autoprograms}\TopoGun 中文版"; Filename: "{app}\ChineseLauncher\TopoGunChineseLauncher.exe"; WorkingDir: "{app}"; IconFilename: "{app}\ChineseLauncher\topogun.ico"; IconIndex: 0; Tasks: startmenuicon
 #endif
 
-; TopoGun file associations are not modified.
 [UninstallDelete]
 Type: filesandordirs; Name: "{app}\ChineseLauncher"
 
-; Do not create a new default ProgID or write UserChoice.
 
 [Code]
 var
@@ -103,6 +102,8 @@ function StateFile: String;
 begin
   Result := InstallRoot + '\.inno\install-state.ini';
 end;
+
+#include "association.iss"
 
 function BufferText(Buffer: String): String;
 var
@@ -219,6 +220,8 @@ begin
         'Software\Microsoft\Windows\CurrentVersion\Uninstall\TopoGunChinese.Inno.Experimental_is1');
       #endif
     CleanupInstallerBackups;
+    if WizardIsTaskSelected('fileassoc') then InstallFileAssociation
+    else RestoreFileAssociation;
   end;
 end;
 
@@ -267,7 +270,7 @@ begin
       UnloadDLL(InstallRoot + '\.inno\support.dll');
     end;
 
+    RestoreFileAssociation;
     CleanupInstallerBackups;
-
   end;
 end;

@@ -3,7 +3,7 @@ TopoGun 3 中文补丁 1.0.0（正式版）
 1. 保存场景并关闭 TopoGun。
 2. 运行 dist\TopoGunChineseInstaller.exe。
 3. 选择包含 TopoGun.exe 的软件目录，默认 C:\Program Files\TopoGun 3。
-4. 安装后从“TopoGun 中文版”快捷方式启动，F3 切换中英文。
+4. 默认勾选 .tgs 工程文件关联。安装后可双击工程或从“TopoGun 中文版”快捷方式启动，F3 切换中英文。
 
 兼容目标为 Qt 5.12 及以上的 Qt 5 MSVC x64 版本，不锁定补丁版本，不支持 Qt 5.6。启动前检查汉化所需 Qt 导出接口；接口缺失或 DLL 加载失败时尝试启动原版并提示原因。当前词典共 1743 条。实际界面覆盖与不同宿主版本仍需运行验证。
 补丁位于软件目录的 ChineseLauncher 子目录；从 Windows“已安装的应用”卸载。
