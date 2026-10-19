@@ -1,5 +1,5 @@
-// Validate the TopoGun install directory and ensure it is not in use.
-// No Qt dependency, process injection, process termination or shell execution.
+﻿// Validate the TopoGun install directory and ensure it is not in use.
+// No Qt dependency, injection or shell execution; consent-gated scoped process closure.
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
@@ -9,6 +9,8 @@
 #include <vector>
 #include "../qt_compatibility.h"
 
+
+#include "install_process.h"
 
 namespace {
 struct Handle {
@@ -84,33 +86,17 @@ bool safeTree(const std::filesystem::path& path, unsigned depth, unsigned& count
     return true;
 }
 
+std::vector<std::wstring> installProcessPaths(const std::wstring& root) {
+    return {root + L"\\" + hostName(root), root + L"\\ChineseLauncher\\" + kLauncher};
+}
 bool hostStopped(const std::wstring& root) {
-    Handle snapshot(CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0));
-    if (snapshot.value == INVALID_HANDLE_VALUE) return false;
-    PROCESSENTRY32W item{};
-    item.dwSize = sizeof(item);
-    if (!Process32FirstW(snapshot.value, &item)) return false;
-    do {
-        if (_wcsicmp(item.szExeFile, hostName(root).c_str()) != 0 &&
-            _wcsicmp(item.szExeFile, kLauncher) != 0) continue;
-        Handle process(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, item.th32ProcessID));
-        if (!process.value) {
-            if (GetLastError() == ERROR_INVALID_PARAMETER) continue; // Exited meanwhile.
-            return false;
-        }
-        wchar_t path[32768]{};
-        DWORD length = 32768;
-        if (!QueryFullProcessImageNameW(process.value, 0, path, &length)) return false;
-        if (_wcsicmp(path, (root + L"\\" + hostName(root)).c_str()) == 0 ||
-            _wcsicmp(path, (root + L"\\ChineseLauncher\\" + kLauncher).c_str()) == 0) return false;
-    } while (Process32NextW(snapshot.value, &item));
-    return GetLastError() == ERROR_NO_MORE_FILES;
+    return InstallerProcess::state(installProcessPaths(root)) == 0;
 }
 
 }
 
-extern "C" __declspec(dllexport) BOOL __stdcall CheckTarget(
-    const wchar_t* directory, BOOL checkVersion, wchar_t* message, unsigned capacity) {
+extern "C" __declspec(dllexport) BOOL __stdcall CheckTargetEx(
+    const wchar_t* directory, BOOL checkVersion, BOOL checkRunning, wchar_t* message, unsigned capacity) {
     if (message && capacity) message[0] = L'\0';
     try {
         const std::wstring root(directory ? directory : L"");
@@ -123,9 +109,31 @@ extern "C" __declspec(dllexport) BOOL __stdcall CheckTarget(
                 return fail(L"请选择包含 x64 TopoGun.exe 的软件目录，不要选择 ChineseLauncher 子目录。", message, capacity);
             if (!productQt(root)) return fail(L"目标 Qt 组件不完整或版本不兼容，请确认软件版本。", message, capacity);
         }
-        if (!hostStopped(root))
+        if (checkRunning && !hostStopped(root))
             return fail(L"TopoGun 或中文启动器正在运行，或无法确认进程状态。请保存工程并正常退出后重试。", message, capacity);
         return TRUE;
     } catch (...) { return fail(L"目录检查出现异常，未执行安装或卸载。", message, capacity); }
 }
 
+
+// Preserve installed uninstaller ABI; setup can validate separately from running state.
+extern "C" __declspec(dllexport) BOOL __stdcall CheckTarget(
+    const wchar_t* directory, BOOL checkVersion, wchar_t* message, unsigned capacity) {
+    return CheckTargetEx(directory, checkVersion, TRUE, message, capacity);
+}
+extern "C" __declspec(dllexport) int __stdcall QueryInstallProcesses(const wchar_t* directory) {
+    try {
+        if (!directory || !safePath(directory)) return -1;
+        return InstallerProcess::state(installProcessPaths(directory));
+    } catch (...) { return -1; }
+}
+extern "C" __declspec(dllexport) BOOL __stdcall StopInstallProcesses(
+    const wchar_t* directory, DWORD* stopped, wchar_t* message, unsigned capacity) {
+    if (stopped) *stopped = 0;
+    if (!CheckTargetEx(directory, TRUE, FALSE, message, capacity)) return FALSE;
+    try {
+        if (!InstallerProcess::stop(installProcessPaths(directory), stopped))
+            return fail(L"无法关闭目标进程、进程重新启动或状态无法确认。尚未替换汉化文件，请重新检测。", message, capacity);
+        return CheckTargetEx(directory, TRUE, TRUE, message, capacity);
+    } catch (...) { return fail(L"关闭目标进程失败，尚未替换汉化文件。", message, capacity); }
+}

@@ -1,4 +1,4 @@
-; Inno Setup is the sole supported installer. Runtime payload is allowlisted.
+﻿; Inno Setup is the sole supported installer. Runtime payload is allowlisted.
 #ifndef PayloadInclude
   #error Build using source\build_inno.bat
 #endif
@@ -13,6 +13,8 @@
 AppId={#ProductId}
 AppName={#ProductName}
 AppVersion={#PackageVersion}
+VersionInfoVersion={#PackageVersion}
+VersionInfoProductVersion={#PackageVersion}
 AppPublisher=神说要凑数
 AppPublisherURL=https://space.bilibili.com/281243426
 DefaultDirName={autopf}\TopoGun 3
@@ -83,6 +85,13 @@ Type: filesandordirs; Name: "{app}\ChineseLauncher"
 var
   PayloadNames: TArrayOfString;
 
+function CheckTargetEx(Directory: String; CheckVersion, CheckRunning: Boolean; Message: String; Capacity: Cardinal): Boolean;
+external 'CheckTargetEx@files:support.dll stdcall setuponly';
+function QueryInstallProcesses(Directory: String): Integer;
+external 'QueryInstallProcesses@files:support.dll stdcall setuponly';
+function StopInstallProcesses(Directory: String; var Stopped: Cardinal; Message: String; Capacity: Cardinal): Boolean;
+external 'StopInstallProcesses@files:support.dll stdcall setuponly';
+
 function CheckTarget(Directory: String; CheckVersion: Boolean; Message: String; Capacity: Cardinal): Boolean;
 external 'CheckTarget@files:support.dll stdcall setuponly';
 function CheckTargetUninstall(Directory: String; CheckVersion: Boolean; Message: String; Capacity: Cardinal): Boolean;
@@ -114,12 +123,14 @@ begin
   else Result := Buffer;
 end;
 
+#include "install_policy.iss"
+
 function ValidateDirectory(Directory: String): String;
 var
   Message: String;
 begin
   SetLength(Message, 1024);
-  if CheckTarget(Directory, True, Message, 1024) then Result := ''
+  if CheckTargetEx(Directory, True, False, Message, 1024) then Result := ''
   else Result := BufferText(Message);
 end;
 
@@ -139,6 +150,9 @@ var
   PreviousDir, ExistingOwner: String;
   RegistryRoot: Integer;
 begin
+  InstallWarnings := '';
+  AssociationReady := True;
+  LegacyReady := True;
   Result := ValidateDirectory(ExpandConstant('{app}'));
   if Result <> '' then Exit;
   ExistingOwner := GetIniString('Install', 'Owner', '', StateFile);
@@ -159,6 +173,7 @@ begin
     Exit;
   end;
 
+  Result := EnsureInstallStopped(ExpandConstant('{app}'));
 end;
 
 procedure BackupExistingPayload;
@@ -196,13 +211,15 @@ end;
 procedure CurStepChanged(CurStep: TSetupStep);
 begin
   if CurStep = ssInstall then begin
+    if EnsureInstallStopped(ExpandConstant('{app}')) <> '' then
+      RaiseException('尚未安全关闭目标软件，未开始替换汉化文件。');
     #ifndef TestMode
     if FileExists(ExpandConstant('{userdesktop}\TopoGun 中文版.lnk')) and
       not DeleteFile(ExpandConstant('{userdesktop}\TopoGun 中文版.lnk')) then
-      RaiseException('无法清理旧版当前用户桌面快捷方式，请关闭占用程序后重试。');
+      AddInstallWarning('无法清理旧版当前用户桌面快捷方式，请关闭占用程序后重试。');
     if FileExists(ExpandConstant('{userprograms}\TopoGun 中文版.lnk')) and
       not DeleteFile(ExpandConstant('{userprograms}\TopoGun 中文版.lnk')) then
-      RaiseException('无法清理旧版当前用户开始菜单快捷方式，请关闭占用程序后重试。');
+      AddInstallWarning('无法清理旧版当前用户开始菜单快捷方式，请关闭占用程序后重试。');
     #endif
     BackupExistingPayload;
   end;
@@ -219,9 +236,14 @@ begin
       RegDeleteKeyIncludingSubkeys(HKLM64,
         'Software\Microsoft\Windows\CurrentVersion\Uninstall\TopoGunChinese.Inno.Experimental_is1');
       #endif
-    CleanupInstallerBackups;
+    try
+      CleanupInstallerBackups;
+    except
+      AddInstallWarning(GetExceptionMessage);
+    end;
     if WizardIsTaskSelected('fileassoc') then InstallFileAssociation
     else RestoreFileAssociation;
+    FinishInstallPolicy;
   end;
 end;
 
